@@ -41,7 +41,7 @@
       when: ticket_id is defined and ticket_id | length > 0
 
     - name: Connectivity check
-      community.postgresql.postgresql_query:
+      edb.epas_postgresql.postgresql_query:
         login_host: "{{ pg_host }}"
         login_port: "{{ pg_port }}"
         login_user: "{{ pg_user }}"
@@ -52,7 +52,7 @@
       delegate_to: localhost
 
     - name: Collect after metrics
-      community.postgresql.postgresql_query:
+      edb.epas_postgresql.postgresql_query:
         login_host: "{{ pg_host }}"
         login_port: "{{ pg_port }}"
         login_user: "{{ pg_user }}"

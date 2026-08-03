@@ -65,7 +65,10 @@ JT01 Health Check → JT02 Abrir Ticket → JT03 Manutenção → JT04 Validar �
                                          JT06 Evidências → JT07 Ticket pendente
 ```
 
-## Evidência da última execução bem-sucedida
+## Collections
+
+- `edb.epas_postgresql` — queries e manutenção PostgreSQL/EPAS
+- `community.general` — utilitários gerais
 
 - Ticket ITSM `DBA-1001` fechado automaticamente
 - `public.itens_pedido`: 63.07% → 0% dead tuples

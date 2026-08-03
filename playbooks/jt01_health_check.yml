@@ -31,7 +31,7 @@
       no_log: true
 
     - name: Collect PostgreSQL version and size
-      community.postgresql.postgresql_query:
+      edb.epas_postgresql.postgresql_query:
         login_host: "{{ pg_host }}"
         login_port: "{{ pg_port }}"
         login_user: "{{ pg_user }}"
@@ -48,7 +48,7 @@
       delegate_to: localhost
 
     - name: Diagnose tables with dead tuples
-      community.postgresql.postgresql_query:
+      edb.epas_postgresql.postgresql_query:
         login_host: "{{ pg_host }}"
         login_port: "{{ pg_port }}"
         login_user: "{{ pg_user }}"

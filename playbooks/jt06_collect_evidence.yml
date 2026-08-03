@@ -29,7 +29,7 @@
       when: vault_secret_resp is succeeded
 
     - name: Collect activity and locks evidence
-      community.postgresql.postgresql_query:
+      edb.epas_postgresql.postgresql_query:
         login_host: "{{ pg_host }}"
         login_port: "{{ pg_port }}"
         login_user: "{{ pg_user }}"

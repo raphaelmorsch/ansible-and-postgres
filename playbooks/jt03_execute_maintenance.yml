@@ -35,7 +35,7 @@
       no_log: true
 
     - name: Safety checks before maintenance
-      community.postgresql.postgresql_query:
+      edb.epas_postgresql.postgresql_query:
         login_host: "{{ pg_host }}"
         login_port: "{{ pg_port }}"
         login_user: "{{ pg_user }}"
@@ -121,7 +121,7 @@
           }}
 
     - name: Capture before metrics
-      community.postgresql.postgresql_query:
+      edb.epas_postgresql.postgresql_query:
         login_host: "{{ pg_host }}"
         login_port: "{{ pg_port }}"
         login_user: "{{ pg_user }}"
@@ -142,7 +142,7 @@
       when: tables_to_maintain | length > 0
 
     - name: Run VACUUM ANALYZE for selected tables
-      community.postgresql.postgresql_query:
+      edb.epas_postgresql.postgresql_query:
         login_host: "{{ pg_host }}"
         login_port: "{{ pg_port }}"
         login_user: "{{ pg_user }}"
