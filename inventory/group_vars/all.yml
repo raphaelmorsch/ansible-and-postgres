@@ -1,0 +1,7 @@
+---
+# Overridden by AAP Job Template / Workflow extra_vars after deploy.
+vault_base_url: "http://mock-vault.mock-vault.svc.cluster.local:8080"
+itsm_base_url: "http://mock-itsm.mock-itsm.svc.cluster.local:8080"
+force_maintenance_window: true
+pg_max_connections_for_maintenance: 50
+pg_excluded_tables: []

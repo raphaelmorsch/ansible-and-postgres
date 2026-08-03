@@ -1,0 +1,121 @@
+---
+- name: JT04 — Validar Resultado
+  hosts: postgresql
+  gather_facts: false
+  vars:
+    vault_url: "{{ vault_base_url }}"
+    vault_secret_name: "{{ vault_secret | default('postgresql-prod') }}"
+    itsm_url: "{{ itsm_base_url }}"
+  tasks:
+    - name: Fetch database credentials from Mock Vault
+      ansible.builtin.uri:
+        url: "{{ vault_url }}/secrets/{{ vault_secret_name }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      register: vault_secret_resp
+      no_log: true
+      delegate_to: localhost
+
+    - name: Set PostgreSQL connection facts from vault
+      ansible.builtin.set_fact:
+        pg_user: "{{ vault_secret_resp.json.username }}"
+        pg_password: "{{ vault_secret_resp.json.password }}"
+        pg_db: "{{ vault_secret_resp.json.database }}"
+        pg_host: "{{ vault_secret_resp.json.host | default(inventory_hostname) }}"
+        pg_port: "{{ vault_secret_resp.json.port | default(5432) }}"
+      no_log: true
+
+    - name: Mark ticket in validation
+      ansible.builtin.uri:
+        url: "{{ itsm_url }}/api/tickets/{{ ticket_id }}"
+        method: PATCH
+        body_format: json
+        validate_certs: false
+        status_code: 200
+        body:
+          status: validation
+          comment: "Manutenção concluída. Iniciando validações pós-execução."
+      delegate_to: localhost
+      when: ticket_id is defined and ticket_id | length > 0
+
+    - name: Connectivity check
+      community.postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: "SELECT 1 AS ok;"
+      register: connectivity
+      delegate_to: localhost
+
+    - name: Collect after metrics
+      community.postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          SELECT
+            schemaname || '.' || relname AS fq_name,
+            n_live_tup,
+            n_dead_tup,
+            ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_tuple_percent,
+            last_vacuum,
+            last_analyze,
+            pg_size_pretty(pg_total_relation_size(schemaname || '.' || relname)) AS total_size
+          FROM pg_stat_user_tables
+          ORDER BY dead_tuple_percent DESC NULLS LAST;
+      register: after_metrics
+      delegate_to: localhost
+
+    - name: Initialize comparison list
+      ansible.builtin.set_fact:
+        comparison: []
+
+    - name: Build before/after comparison rows
+      ansible.builtin.set_fact:
+        comparison: "{{ comparison + [row] }}"
+      vars:
+        before_rows: "{{ before_metrics | default([]) }}"
+        after_rows: "{{ after_metrics.query_result | default([]) }}"
+        before_match: "{{ before_rows | selectattr('table_name', 'equalto', item.table_name) | list }}"
+        after_match: "{{ after_rows | selectattr('fq_name', 'equalto', item.fq_name) | list }}"
+        before: "{{ before_match[0] if (before_match | length) > 0 else {} }}"
+        after: "{{ after_match[0] if (after_match | length) > 0 else {} }}"
+        row:
+          table: "{{ item.fq_name }}"
+          dead_before: "{{ before.n_dead_tup | default('n/a') }}"
+          dead_after: "{{ after.n_dead_tup | default('n/a') }}"
+          pct_before: "{{ before.dead_tuple_percent | default('n/a') }}"
+          pct_after: "{{ after.dead_tuple_percent | default('n/a') }}"
+          size_after: "{{ after.total_size | default('n/a') }}"
+      loop: "{{ maintained_tables | default([]) }}"
+      loop_control:
+        label: "{{ item.fq_name | default(item) }}"
+      when: maintained_tables is defined and (maintained_tables | length) > 0
+
+    - name: Publish validation artifacts
+      ansible.builtin.set_stats:
+        data:
+          validation_ok: "{{ (connectivity.query_result[0].ok | default(0) | int) == 1 }}"
+          after_metrics: "{{ after_metrics.query_result }}"
+          comparison: "{{ comparison | default([]) }}"
+          maintained_tables: "{{ maintained_tables | default([]) }}"
+          maintenance_actions_done: "{{ maintenance_actions_done | default([]) }}"
+          ticket_id: "{{ ticket_id | default('') }}"
+          pg_database: "{{ pg_db }}"
+          validation_summary: >-
+            Banco acessível. Objetos validados. Comparativo antes/depois disponível para
+            {{ (comparison | default([]) | length) }} tabela(s).
+        per_host: false
+
+    - name: Show validation summary
+      ansible.builtin.debug:
+        msg:
+          validation_ok: "{{ (connectivity.query_result[0].ok | default(0) | int) == 1 }}"
+          comparison: "{{ comparison | default([]) }}"
+          after_metrics: "{{ after_metrics.query_result }}"

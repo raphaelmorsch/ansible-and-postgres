@@ -1,0 +1,176 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mock-vault
+  labels:
+    app.kubernetes.io/part-of: aap-pg-maintenance
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-vault-app
+  namespace: mock-vault
+data:
+  app.py: |
+    #!/usr/bin/env python3
+    from __future__ import annotations
+    import os
+    from flask import Flask, jsonify, request
+
+    app = Flask(__name__)
+
+    SECRETS = {
+        "postgresql-prod": {
+            "username": os.environ.get("PG_USERNAME", "user1"),
+            "password": os.environ.get("PG_PASSWORD", "password1"),
+            "database": os.environ.get("PG_DATABASE", "sampledb"),
+            "host": os.environ.get("PG_HOST", "postgresql.postgresql.svc.cluster.local"),
+            "port": int(os.environ.get("PG_PORT", "5432")),
+        },
+        "postgresql-dev": {
+            "username": os.environ.get("PG_USERNAME", "user1"),
+            "password": os.environ.get("PG_PASSWORD", "password1"),
+            "database": os.environ.get("PG_DATABASE", "sampledb"),
+            "host": os.environ.get("PG_HOST", "postgresql.postgresql.svc.cluster.local"),
+            "port": int(os.environ.get("PG_PORT", "5432")),
+        },
+    }
+
+    @app.get("/healthz")
+    def healthz():
+        return jsonify({"status": "ok", "service": "mock-vault"})
+
+    @app.get("/secrets/<path:secret_name>")
+    def get_secret(secret_name: str):
+        secret = SECRETS.get(secret_name)
+        if not secret:
+            return jsonify({"error": f"secret '{secret_name}' not found"}), 404
+        if request.args.get("mask") == "1":
+            masked = dict(secret)
+            masked["password"] = "********"
+            return jsonify(masked)
+        return jsonify(secret)
+
+    @app.get("/")
+    def index():
+        return jsonify({
+            "service": "Mock Vault",
+            "description": "Corporate secrets mock for AAP PostgreSQL maintenance demo",
+            "endpoints": {
+                "health": "/healthz",
+                "examples": ["/secrets/postgresql-prod", "/secrets/postgresql-dev"],
+            },
+        })
+  requirements.txt: |
+    flask==3.0.3
+    gunicorn==22.0.0
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mock-vault-pg
+  namespace: mock-vault
+type: Opaque
+stringData:
+  PG_USERNAME: user1
+  PG_PASSWORD: password1
+  PG_DATABASE: sampledb
+  PG_HOST: postgresql.postgresql.svc.cluster.local
+  PG_PORT: "5432"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-vault
+  namespace: mock-vault
+  labels:
+    app: mock-vault
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-vault
+  template:
+    metadata:
+      labels:
+        app: mock-vault
+    spec:
+      containers:
+        - name: mock-vault
+          image: registry.access.redhat.com/ubi9/python-311:latest
+          imagePullPolicy: IfNotPresent
+          workingDir: /opt/app-root/src
+          command:
+            - /bin/bash
+            - -c
+            - |
+              pip install --no-cache-dir -r /app/requirements.txt
+              exec gunicorn --bind 0.0.0.0:8080 --workers 2 app:app
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - secretRef:
+                name: mock-vault-pg
+          volumeMounts:
+            - name: app
+              mountPath: /opt/app-root/src/app.py
+              subPath: app.py
+            - name: app
+              mountPath: /app/requirements.txt
+              subPath: requirements.txt
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: app
+          configMap:
+            name: mock-vault-app
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-vault
+  namespace: mock-vault
+  labels:
+    app: mock-vault
+spec:
+  selector:
+    app: mock-vault
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: mock-vault
+  namespace: mock-vault
+  labels:
+    app: mock-vault
+spec:
+  to:
+    kind: Service
+    name: mock-vault
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

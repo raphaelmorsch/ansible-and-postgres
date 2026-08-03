@@ -1,0 +1,139 @@
+---
+- name: JT01 — PostgreSQL Health Check
+  hosts: postgresql
+  gather_facts: false
+  vars:
+    vault_url: "{{ vault_base_url }}"
+    vault_secret_name: "{{ vault_secret | default('postgresql-prod') }}"
+    dead_tuple_warn: 10
+    dead_tuple_action: 20
+    # Above this threshold the demo routes to DBA approval instead of auto-fix
+    dead_tuple_approve: 70
+  tasks:
+    - name: Fetch database credentials from Mock Vault
+      ansible.builtin.uri:
+        url: "{{ vault_url }}/secrets/{{ vault_secret_name }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      register: vault_secret_resp
+      no_log: true
+      delegate_to: localhost
+
+    - name: Set PostgreSQL connection facts from vault
+      ansible.builtin.set_fact:
+        pg_user: "{{ vault_secret_resp.json.username }}"
+        pg_password: "{{ vault_secret_resp.json.password }}"
+        pg_db: "{{ vault_secret_resp.json.database }}"
+        pg_host: "{{ vault_secret_resp.json.host | default(inventory_hostname) }}"
+        pg_port: "{{ vault_secret_resp.json.port | default(5432) }}"
+      no_log: true
+
+    - name: Collect PostgreSQL version and size
+      community.postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          SELECT
+            version() AS version,
+            current_database() AS database,
+            pg_size_pretty(pg_database_size(current_database())) AS database_size,
+            (SELECT count(*) FROM pg_stat_activity WHERE state <> 'idle') AS active_connections;
+      register: pg_info
+      no_log: true
+      delegate_to: localhost
+
+    - name: Diagnose tables with dead tuples
+      community.postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          SELECT
+            schemaname,
+            relname AS table_name,
+            n_live_tup,
+            n_dead_tup,
+            ROUND(
+              100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0),
+              2
+            ) AS dead_tuple_percent,
+            last_vacuum,
+            last_autovacuum,
+            last_analyze,
+            last_autoanalyze,
+            pg_size_pretty(pg_total_relation_size(schemaname || '.' || relname)) AS total_size
+          FROM pg_stat_user_tables
+          WHERE n_dead_tup > 0
+          ORDER BY dead_tuple_percent DESC NULLS LAST;
+      register: dead_tuples
+      no_log: true
+      delegate_to: localhost
+
+    - name: Initialize classification list
+      ansible.builtin.set_fact:
+        classified_tables: []
+
+    - name: Classify each table by dead tuple policy
+      ansible.builtin.set_fact:
+        classified_tables: "{{ classified_tables + [classified] }}"
+      vars:
+        pct: "{{ item.dead_tuple_percent | float }}"
+        action: >-
+          {{
+            'approve_required' if (pct | float) >= (dead_tuple_approve | float)
+            else (
+              'vacuum_analyze_reindex_eval' if (pct | float) >= (dead_tuple_action | float)
+              else (
+                'vacuum_analyze' if (pct | float) >= (dead_tuple_warn | float)
+                else 'none'
+              )
+            )
+          }}
+        classified:
+          schemaname: "{{ item.schemaname }}"
+          table_name: "{{ item.table_name }}"
+          fq_name: "{{ item.schemaname }}.{{ item.table_name }}"
+          n_live_tup: "{{ item.n_live_tup }}"
+          n_dead_tup: "{{ item.n_dead_tup }}"
+          dead_tuple_percent: "{{ item.dead_tuple_percent }}"
+          total_size: "{{ item.total_size }}"
+          last_vacuum: "{{ item.last_vacuum }}"
+          last_analyze: "{{ item.last_analyze }}"
+          action: "{{ action | trim }}"
+      loop: "{{ dead_tuples.query_result | default([]) }}"
+      loop_control:
+        label: "{{ item.schemaname }}.{{ item.table_name }}"
+
+    - name: Publish health check artifacts for workflow
+      ansible.builtin.set_stats:
+        data:
+          pg_database: "{{ pg_info.query_result[0].database }}"
+          pg_version: "{{ pg_info.query_result[0].version }}"
+          pg_database_size: "{{ pg_info.query_result[0].database_size }}"
+          pg_active_connections: "{{ pg_info.query_result[0].active_connections }}"
+          pg_environment: "{{ pg_environment | default('producao') }}"
+          vault_secret_name: "{{ vault_secret_name }}"
+          tables_needing_maintenance: "{{ classified_tables | selectattr('action', 'ne', 'none') | list }}"
+          all_dead_tuple_tables: "{{ classified_tables }}"
+          maintenance_required: "{{ (classified_tables | selectattr('action', 'ne', 'none') | list | length) > 0 }}"
+          healthcheck_summary: >-
+            Foram identificadas
+            {{ classified_tables | selectattr('action', 'ne', 'none') | list | length }}
+            tabelas acima do limite de tuplas mortas.
+        per_host: false
+
+    - name: Show health check summary
+      ansible.builtin.debug:
+        msg:
+          database: "{{ pg_info.query_result[0].database }}"
+          size: "{{ pg_info.query_result[0].database_size }}"
+          active_connections: "{{ pg_info.query_result[0].active_connections }}"
+          tables_needing_maintenance: "{{ classified_tables | selectattr('action', 'ne', 'none') | map(attribute='fq_name') | list }}"
+          classified_tables: "{{ classified_tables }}"

@@ -1,0 +1,62 @@
+---
+- name: JT06 — Coletar evidências (falha)
+  hosts: postgresql
+  gather_facts: false
+  vars:
+    vault_url: "{{ vault_base_url }}"
+    vault_secret_name: "{{ vault_secret | default('postgresql-prod') }}"
+  tasks:
+    - name: Fetch database credentials from Mock Vault
+      ansible.builtin.uri:
+        url: "{{ vault_url }}/secrets/{{ vault_secret_name }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      register: vault_secret_resp
+      no_log: true
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Set PostgreSQL connection facts from vault
+      ansible.builtin.set_fact:
+        pg_user: "{{ vault_secret_resp.json.username }}"
+        pg_password: "{{ vault_secret_resp.json.password }}"
+        pg_database: "{{ vault_secret_resp.json.database }}"
+        pg_host: "{{ vault_secret_resp.json.host | default(inventory_hostname) }}"
+        pg_port: "{{ vault_secret_resp.json.port | default(5432) }}"
+      no_log: true
+      when: vault_secret_resp is succeeded
+
+    - name: Collect activity and locks evidence
+      community.postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_database }}"
+        query: |
+          SELECT pid, usename, application_name, state, query_start, left(query, 200) AS query
+          FROM pg_stat_activity
+          WHERE state <> 'idle'
+          ORDER BY query_start NULLS LAST;
+      register: activity
+      no_log: true
+      delegate_to: localhost
+      ignore_errors: true
+      when: vault_secret_resp is succeeded
+
+    - name: Publish failure evidence
+      ansible.builtin.set_stats:
+        data:
+          failure_evidence:
+            activity: "{{ activity.query_result | default([]) }}"
+            ticket_id: "{{ ticket_id | default('') }}"
+            note: "Evidências coletadas após falha na manutenção."
+        per_host: false
+
+    - name: Show evidence summary
+      ansible.builtin.debug:
+        msg:
+          ticket_id: "{{ ticket_id | default('N/A') }}"
+          active_sessions: "{{ activity.query_result | default([]) | length }}"

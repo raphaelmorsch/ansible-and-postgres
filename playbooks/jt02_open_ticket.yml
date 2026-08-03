@@ -1,0 +1,61 @@
+---
+- name: JT02 — Abrir Ticket de Manutenção
+  hosts: localhost
+  gather_facts: false
+  vars:
+    itsm_url: "{{ itsm_base_url }}"
+    database_name: "{{ pg_database | default('sampledb') }}"
+    environment_name: "{{ pg_environment | default('producao') }}"
+    affected: "{{ tables_needing_maintenance | default([]) }}"
+  tasks:
+    - name: Skip ticket creation when no maintenance is required
+      ansible.builtin.debug:
+        msg: "Nenhuma tabela acima do limiar. Ticket não será aberto."
+      when: not (maintenance_required | default(false) | bool)
+
+    - name: Create maintenance ticket in ITSM Mock
+      ansible.builtin.uri:
+        url: "{{ itsm_url }}/api/tickets"
+        method: POST
+        body_format: json
+        validate_certs: false
+        status_code: 201
+        body:
+          title: "Manutenção preventiva PostgreSQL"
+          database: "{{ database_name }}"
+          environment: "{{ environment_name }}"
+          priority: "{{ 'high' if (affected | length) >= 3 else 'medium' }}"
+          status: open
+          description: >-
+            {{ healthcheck_summary
+               | default('Foram identificadas tabelas acima do limite de tuplas mortas.') }}
+          affected_objects: "{{ affected | map(attribute='fq_name') | list }}"
+          assignee: "Ansible Automation Platform"
+          comment: "Ticket aberto automaticamente pelo AAP após diagnóstico."
+          metadata:
+            vault_secret: "{{ vault_secret_name | default('postgresql-prod') }}"
+            pg_version: "{{ pg_version | default('') }}"
+            pg_database_size: "{{ pg_database_size | default('') }}"
+      register: ticket_create
+      when: maintenance_required | default(false) | bool
+
+    - name: Publish ticket facts for workflow
+      ansible.builtin.set_stats:
+        data:
+          ticket_id: "{{ ticket_create.json.ticket_id | default('') }}"
+          ticket_status: "{{ ticket_create.json.status | default('skipped') }}"
+          ticket_created: "{{ (ticket_create is defined) and (ticket_create is succeeded) and ((ticket_create.json.ticket_id | default('')) | length > 0) }}"
+          # Pass through maintenance artifacts for downstream nodes
+          tables_needing_maintenance: "{{ tables_needing_maintenance | default([]) }}"
+          maintenance_required: "{{ maintenance_required | default(false) | bool }}"
+          pg_database: "{{ database_name }}"
+          pg_environment: "{{ environment_name }}"
+          vault_secret_name: "{{ vault_secret_name | default('postgresql-prod') }}"
+        per_host: false
+
+    - name: Show created ticket
+      ansible.builtin.debug:
+        msg:
+          ticket_id: "{{ ticket_create.json.ticket_id | default('N/A') }}"
+          status: "{{ ticket_create.json.status | default('skipped') }}"
+          affected_objects: "{{ affected | map(attribute='fq_name') | list }}"

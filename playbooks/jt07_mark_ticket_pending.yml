@@ -1,0 +1,37 @@
+---
+- name: JT07 — Atualizar ticket como pendente
+  hosts: localhost
+  gather_facts: false
+  vars:
+    itsm_url: "{{ itsm_base_url }}"
+  tasks:
+    - name: Mark ticket pending for DBA intervention
+      ansible.builtin.uri:
+        url: "{{ itsm_url }}/api/tickets/{{ ticket_id }}"
+        method: PATCH
+        body_format: json
+        validate_certs: false
+        status_code: 200
+        body:
+          status: pending
+          resolution: null
+          comment: |
+            Manutenção falhou ou foi interrompida.
+            Evidências coletadas pelo AAP.
+            Sessões ativas no momento da falha: {{ (failure_evidence.activity | default([])) | length }}.
+            Notificar DBA para intervenção manual.
+      when: ticket_id is defined and ticket_id | length > 0
+
+    - name: Publish pending status
+      ansible.builtin.set_stats:
+        data:
+          ticket_status: pending
+          dba_notification: "Notificar DBA — manutenção preventiva pendente"
+        per_host: false
+
+    - name: Show pending ticket
+      ansible.builtin.debug:
+        msg:
+          ticket_id: "{{ ticket_id | default('N/A') }}"
+          status: pending
+          notification: "Notificar DBA"

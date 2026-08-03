@@ -1,0 +1,58 @@
+---
+- name: JT05 — Atualizar e Encerrar Ticket
+  hosts: localhost
+  gather_facts: false
+  vars:
+    itsm_url: "{{ itsm_base_url }}"
+  tasks:
+    - name: Build final maintenance report
+      ansible.builtin.set_fact:
+        final_report: |
+          Manutenção preventiva concluída com sucesso.
+
+          Banco: {{ pg_database | default('sampledb') }}
+          Ambiente: {{ pg_environment | default('producao') }}
+          Objetos processados: {{ (maintained_tables | default([]) | length) }} tabela(s)
+
+          Ações:
+          {% for action in maintenance_actions_done | default([]) -%}
+          - {{ action }}
+          {% endfor %}
+
+          Resultado comparativo:
+          {% for row in comparison | default([]) -%}
+          - {{ row.table }}: tuplas mortas {{ row.dead_before }} ({{ row.pct_before }}%) → {{ row.dead_after }} ({{ row.pct_after }}%)
+          {% endfor %}
+
+          Validação: {{ validation_summary | default('Banco disponível e objetos validados.') }}
+          Job do AAP: #{{ tower_job_id | default(lookup('env', 'JOB_ID') | default('n/a', true)) }}
+          Responsável: Ansible Automation Platform
+
+    - name: Close ticket in ITSM Mock
+      ansible.builtin.uri:
+        url: "{{ itsm_url }}/api/tickets/{{ ticket_id }}"
+        method: PATCH
+        body_format: json
+        validate_certs: false
+        status_code: 200
+        body:
+          status: closed
+          resolution: "Manutenção executada automaticamente"
+          assignee: "Ansible Automation Platform"
+          comment: "{{ final_report }}"
+      register: ticket_close
+      when: ticket_id is defined and ticket_id | length > 0
+
+    - name: Publish closure artifacts
+      ansible.builtin.set_stats:
+        data:
+          ticket_status: closed
+          final_report: "{{ final_report }}"
+        per_host: false
+
+    - name: Show closed ticket
+      ansible.builtin.debug:
+        msg:
+          ticket_id: "{{ ticket_id | default('N/A') }}"
+          status: closed
+          report: "{{ final_report }}"
