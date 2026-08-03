@@ -48,6 +48,7 @@ python3 scripts/setup_container_group.py   # necessário quando não há executi
 | Workflow | Templates → **WF — Manutenção Preventiva PostgreSQL** |
 | Mock Vault | https://mock-vault-mock-vault.apps.cluster-bfd7z-1.dyn.redhatworkshops.io |
 | Mock ITSM UI | https://mock-itsm-mock-itsm.apps.cluster-bfd7z-1.dyn.redhatworkshops.io |
+| Playbooks (browser) | https://demo-playbooks-ui-demo-git.apps.cluster-bfd7z-1.dyn.redhatworkshops.io/ |
 | Git SCM (interno) | `http://demo-git.demo-git.svc.cluster.local/ansible-and-postgres.git` |
 
 ## Política de tuplas mortas
@@ -64,6 +65,17 @@ JT01 Health Check → JT02 Abrir Ticket → JT03 Manutenção → JT04 Validar �
                                               ↓ (falha)
                                          JT06 Evidências → JT07 Ticket pendente
 ```
+
+## Gerar tuplas mortas sob demanda
+
+Antes de demonstrar o workflow, rode um destes:
+
+```bash
+# OpenShift Job (recomendado)
+./scripts/generate_dead_tuples.sh
+```
+
+Ou no AAP: Job Template **JT00 — Gerar Tuplas Mortas**.
 
 ## Collections
 

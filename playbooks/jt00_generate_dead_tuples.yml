@@ -1,0 +1,69 @@
+---
+# Optional AAP Job Template: generate dead tuples before running the maintenance workflow.
+- name: JT00 — Gerar Tuplas Mortas (demo)
+  hosts: postgresql
+  gather_facts: false
+  vars:
+    vault_url: "{{ vault_base_url }}"
+    vault_secret_name: "{{ vault_secret | default('postgresql-prod') }}"
+  tasks:
+    - name: Fetch database credentials from Mock Vault
+      ansible.builtin.uri:
+        url: "{{ vault_url }}/secrets/{{ vault_secret_name }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      register: vault_secret_resp
+      no_log: true
+      delegate_to: localhost
+
+    - name: Set PostgreSQL connection facts from vault
+      ansible.builtin.set_fact:
+        pg_user: "{{ vault_secret_resp.json.username }}"
+        pg_password: "{{ vault_secret_resp.json.password }}"
+        pg_db: "{{ vault_secret_resp.json.database }}"
+        pg_host: "{{ vault_secret_resp.json.host | default(inventory_hostname) }}"
+        pg_port: "{{ vault_secret_resp.json.port | default(5432) }}"
+      no_log: true
+
+    - name: Stage SQL script on the execution environment
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../sql/generate_dead_tuples.sql"
+        dest: /tmp/generate_dead_tuples.sql
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: Execute dead-tuple generator script
+      edb.epas_postgresql.postgresql_script:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        path: /tmp/generate_dead_tuples.sql
+      register: seed_result
+      delegate_to: localhost
+
+    - name: Read dead tuple stats after generation
+      edb.epas_postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          SELECT
+            schemaname,
+            relname AS table_name,
+            n_live_tup,
+            n_dead_tup,
+            ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_tuple_percent
+          FROM pg_stat_user_tables
+          ORDER BY dead_tuple_percent DESC NULLS LAST;
+      register: stats
+      delegate_to: localhost
+
+    - name: Show generated dead tuple stats
+      ansible.builtin.debug:
+        msg: "{{ stats.query_result }}"

@@ -249,6 +249,7 @@ def main():
     }
 
     job_templates = [
+        ("JT00 — Gerar Tuplas Mortas", "playbooks/jt00_generate_dead_tuples.yml"),
         ("JT01 — PostgreSQL Health Check", "playbooks/jt01_health_check.yml"),
         ("JT02 — Abrir Ticket de Manutenção", "playbooks/jt02_open_ticket.yml"),
         ("JT03 — Executar Manutenção PostgreSQL", "playbooks/jt03_execute_maintenance.yml"),
@@ -361,14 +362,17 @@ def main():
     except RuntimeError as exc:
         print(f"schedule warning (non-fatal): {exc}")
 
-    # Ensure job templates can run on controlplane when no execution nodes exist.
-    control = api.find_one("/instance_groups/", name="controlplane")
-    if control:
+    # Prefer OpenShift container group when available (no execution nodes in this lab).
+    ig = api.find_one("/instance_groups/", name="openshift-ee") or api.find_one(
+        "/instance_groups/", name="controlplane"
+    )
+    if ig:
         for jt_id in jt_ids.values():
             try:
-                api.post(f"/job_templates/{jt_id}/instance_groups/", {"id": control["id"]})
+                api.post(f"/job_templates/{jt_id}/instance_groups/", {"id": ig["id"]})
             except RuntimeError as exc:
                 print(f"instance group assign warning for JT {jt_id}: {exc}")
+        print(f"job templates assigned to instance group {ig['name']} ({ig['id']})")
 
     print(
         json.dumps(
