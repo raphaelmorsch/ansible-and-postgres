@@ -139,7 +139,7 @@ def ensure_deadlock_workflow(ctrl: Api):
             payload["execution_environment"] = ee["id"]
         jt = ctrl.upsert("/job_templates/", jt_name, payload)
         jt_ids[jt_name] = jt["id"]
-        if jt_name.startswith("JT09"):
+        if jt_name.startswith("JT09") or jt_name.startswith("JT11"):
             try:
                 ctrl.post(f"/job_templates/{jt['id']}/credentials/", {"id": openshift_cred["id"]})
             except RuntimeError as exc:
