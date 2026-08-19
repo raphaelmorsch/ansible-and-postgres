@@ -1,0 +1,672 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-writer-app
+  namespace: databases
+data:
+  app.py: |
+    #!/usr/bin/env python3
+    from __future__ import annotations
+    import os
+    import threading
+    import time
+    import json
+    import urllib.request
+    from flask import Flask, jsonify, request
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
+    app = Flask(__name__)
+    APP_NAME = os.environ.get("APP_NAME", "db-writer")
+    ENABLE_STRESS = os.environ.get("ENABLE_STRESS", "false").lower() == "true"
+    ENABLE_DEADLOCK = os.environ.get("ENABLE_DEADLOCK", "false").lower() == "true"
+    EDA_WEBHOOK_URL = os.environ.get("EDA_WEBHOOK_URL", "")
+
+    def conn_params():
+      return {
+        "host": os.environ.get("PGHOST", "postgresql"),
+        "port": int(os.environ.get("PGPORT", "5432")),
+        "user": os.environ.get("PGUSER", "user1"),
+        "password": os.environ.get("PGPASSWORD", "password1"),
+        "dbname": os.environ.get("PGDATABASE", "sampledb"),
+        "application_name": APP_NAME,
+      }
+
+    def ensure_table():
+      with psycopg2.connect(**conn_params()) as conn:
+        with conn.cursor() as cur:
+          cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_events (
+              id BIGSERIAL PRIMARY KEY,
+              app_name TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+          )
+        conn.commit()
+
+    def write_event(payload: str):
+      with psycopg2.connect(**conn_params()) as conn:
+        with conn.cursor() as cur:
+          cur.execute(
+            "INSERT INTO app_events (app_name, payload) VALUES (%s, %s)",
+            (APP_NAME, payload),
+          )
+        conn.commit()
+
+    def ensure_deadlock_table():
+      with psycopg2.connect(**conn_params()) as conn:
+        with conn.cursor() as cur:
+          cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deadlock_lab (
+              id INT PRIMARY KEY,
+              note TEXT NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            INSERT INTO deadlock_lab (id, note)
+            VALUES (1, 'row-1'), (2, 'row-2')
+            ON CONFLICT (id) DO NOTHING;
+            """
+          )
+        conn.commit()
+
+    def run_deadlock_pair():
+      result = {"worker_a": "not-started", "worker_b": "not-started", "deadlock_detected": False}
+
+      def worker(first_id: int, second_id: int, key: str):
+        conn = psycopg2.connect(**conn_params())
+        conn.autocommit = False
+        try:
+          with conn.cursor() as cur:
+            cur.execute("BEGIN")
+            cur.execute("UPDATE deadlock_lab SET note = %s, updated_at = now() WHERE id = %s", (f"{APP_NAME}-{key}-first", first_id))
+            time.sleep(1.0)
+            cur.execute("UPDATE deadlock_lab SET note = %s, updated_at = now() WHERE id = %s", (f"{APP_NAME}-{key}-second", second_id))
+            conn.commit()
+            result[key] = "committed"
+        except Exception as exc:  # one worker should hit deadlock detected
+          conn.rollback()
+          msg = str(exc).lower()
+          if "deadlock detected" in msg:
+            result[key] = "deadlock_detected"
+            result["deadlock_detected"] = True
+          else:
+            result[key] = f"error: {exc}"
+        finally:
+          conn.close()
+
+      t1 = threading.Thread(target=worker, args=(1, 2, "worker_a"))
+      t2 = threading.Thread(target=worker, args=(2, 1, "worker_b"))
+      t1.start()
+      t2.start()
+      t1.join(timeout=20)
+      t2.join(timeout=20)
+      return result
+
+    def notify_eda(event_payload: dict):
+      if not EDA_WEBHOOK_URL:
+        return {"sent": False, "reason": "EDA_WEBHOOK_URL not configured"}
+      try:
+        req = urllib.request.Request(
+          EDA_WEBHOOK_URL,
+          data=json.dumps(event_payload).encode(),
+          headers={"Content-Type": "application/json"},
+          method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+          return {"sent": True, "status": resp.status}
+      except Exception as exc:
+        return {"sent": False, "reason": str(exc)}
+
+    def hold_connection(hold_seconds: int):
+      conn = psycopg2.connect(**conn_params())
+      try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT pg_backend_pid() AS pid")
+        _ = cur.fetchone()
+        time.sleep(hold_seconds)
+      finally:
+        conn.close()
+
+    @app.get("/healthz")
+    def health():
+      return jsonify(
+        {
+          "status": "ok",
+          "app": APP_NAME,
+          "stress_enabled": ENABLE_STRESS,
+          "deadlock_enabled": ENABLE_DEADLOCK,
+        }
+      )
+
+    @app.post("/write")
+    def write():
+      payload = request.get_json(silent=True) or {}
+      message = payload.get("payload", f"write from {APP_NAME}")
+      ensure_table()
+      write_event(message)
+      return jsonify({"status": "written", "app": APP_NAME, "payload": message})
+
+    @app.get("/write")
+    def write_get():
+      ensure_table()
+      write_event(f"write from {APP_NAME}")
+      return jsonify({"status": "written", "app": APP_NAME})
+
+    @app.get("/stats")
+    def stats():
+      with psycopg2.connect(**conn_params()) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+          cur.execute(
+            """
+            SELECT app_name, count(*)::int AS total
+            FROM app_events
+            GROUP BY app_name
+            ORDER BY total DESC
+            """
+          )
+          rows = cur.fetchall()
+      return jsonify({"app": APP_NAME, "events_by_app": rows})
+
+    @app.get("/stress")
+    def stress():
+      if not ENABLE_STRESS:
+        return jsonify({"error": "stress endpoint disabled"}), 403
+
+      connections = max(1, min(int(request.args.get("connections", "60")), 250))
+      hold = max(10, min(int(request.args.get("hold", "45")), 300))
+      ensure_table()
+      write_event(f"stress trigger: {connections} connections for {hold}s")
+
+      for _ in range(connections):
+        threading.Thread(target=hold_connection, args=(hold,), daemon=True).start()
+
+      return jsonify(
+        {
+          "status": "started",
+          "app": APP_NAME,
+          "connections_requested": connections,
+          "hold_seconds": hold,
+        }
+      )
+
+    @app.get("/deadlock")
+    def deadlock():
+      if not ENABLE_DEADLOCK:
+        return jsonify({"error": "deadlock endpoint disabled"}), 403
+
+      ensure_table()
+      ensure_deadlock_table()
+      write_event("deadlock trigger requested")
+      result = run_deadlock_pair()
+      eda = {}
+      if result.get("deadlock_detected"):
+        eda = notify_eda(
+          {
+            "event_type": "postgres_deadlock_detected",
+            "app_name": APP_NAME,
+            "database": os.environ.get("PGDATABASE", "sampledb"),
+            "namespace": os.environ.get("APP_NAMESPACE", "databases"),
+            "timestamp": int(time.time()),
+            "result": result,
+          }
+        )
+      return jsonify({"app": APP_NAME, "result": result, "eda_notification": eda})
+
+    @app.get("/")
+    def index():
+      if ENABLE_STRESS:
+        return """
+        <!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8" />
+          <title>DB Stress Controller</title>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 2rem; }
+            button { padding: 0.8rem 1.2rem; font-size: 1rem; }
+            .danger { background: #c9190b; color: white; border: none; border-radius: 4px; }
+            input { width: 6rem; margin-left: 0.4rem; }
+          </style>
+        </head>
+        <body>
+          <h1>Application: """ + APP_NAME + """</h1>
+          <p>Este botão abre conexões excessivas no PostgreSQL para simular incidente.</p>
+          <label>Conexões: <input id="c" value="80" /></label>
+          <label>Segundos: <input id="h" value="60" /></label>
+          <button class="danger" onclick="go()">Abrir conexões em demasia</button>
+          <pre id="out"></pre>
+          <script>
+            async function go() {
+              const c = document.getElementById('c').value;
+              const h = document.getElementById('h').value;
+              const res = await fetch(`/stress?connections=${c}&hold=${h}`);
+              document.getElementById('out').textContent = await res.text();
+            }
+          </script>
+        </body>
+        </html>
+        """
+      if ENABLE_DEADLOCK:
+        return """
+        <!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8" />
+          <title>Deadlock Controller</title>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 2rem; }
+            button { padding: 0.8rem 1.2rem; font-size: 1rem; background: #6a6e73; color: white; border: none; border-radius: 4px; }
+          </style>
+        </head>
+        <body>
+          <h1>Application: """ + APP_NAME + """</h1>
+          <p>Este botão dispara duas transações concorrentes para provocar deadlock no PostgreSQL.</p>
+          <button onclick="go()">Gerar deadlock</button>
+          <pre id="out"></pre>
+          <script>
+            async function go() {
+              const res = await fetch('/deadlock');
+              document.getElementById('out').textContent = await res.text();
+            }
+          </script>
+        </body>
+        </html>
+        """
+      return jsonify({"app": APP_NAME, "message": "use /write to persist events"})
+
+    if __name__ == "__main__":
+      app.run(host="0.0.0.0", port=8080)
+  requirements.txt: |
+    flask==3.0.3
+    gunicorn==22.0.0
+    psycopg2-binary==2.9.9
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-alpha
+  namespace: databases
+  labels:
+    app: app-alpha
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-alpha
+  template:
+    metadata:
+      labels:
+        app: app-alpha
+    spec:
+      containers:
+        - name: app
+          image: registry.access.redhat.com/ubi9/python-311:latest
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              pip install --no-cache-dir -r /app/requirements.txt
+              exec gunicorn --bind 0.0.0.0:8080 --workers 2 app:app
+          env:
+            - name: APP_NAME
+              value: app-alpha
+            - name: PGHOST
+              value: postgresql.databases.svc.cluster.local
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql
+                  key: database-user
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql
+                  key: database-password
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql
+                  key: database-name
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          volumeMounts:
+            - name: app-code
+              mountPath: /opt/app-root/src/app.py
+              subPath: app.py
+            - name: app-code
+              mountPath: /app/requirements.txt
+              subPath: requirements.txt
+      volumes:
+        - name: app-code
+          configMap:
+            name: db-writer-app
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-alpha
+  namespace: databases
+spec:
+  selector:
+    app: app-alpha
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-beta
+  namespace: databases
+  labels:
+    app: app-beta
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-beta
+  template:
+    metadata:
+      labels:
+        app: app-beta
+    spec:
+      containers:
+        - name: app
+          image: registry.access.redhat.com/ubi9/python-311:latest
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              pip install --no-cache-dir -r /app/requirements.txt
+              exec gunicorn --bind 0.0.0.0:8080 --workers 2 app:app
+          env:
+            - name: APP_NAME
+              value: app-beta
+            - name: PGHOST
+              value: postgresql.databases.svc.cluster.local
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql
+                  key: database-user
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql
+                  key: database-password
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql
+                  key: database-name
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          volumeMounts:
+            - name: app-code
+              mountPath: /opt/app-root/src/app.py
+              subPath: app.py
+            - name: app-code
+              mountPath: /app/requirements.txt
+              subPath: requirements.txt
+      volumes:
+        - name: app-code
+          configMap:
+            name: db-writer-app
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-beta
+  namespace: databases
+spec:
+  selector:
+    app: app-beta
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-gamma-stress
+  namespace: databases
+  labels:
+    app: app-gamma-stress
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-gamma-stress
+  template:
+    metadata:
+      labels:
+        app: app-gamma-stress
+    spec:
+      containers:
+        - name: app
+          image: registry.access.redhat.com/ubi9/python-311:latest
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              pip install --no-cache-dir -r /app/requirements.txt
+              exec gunicorn --bind 0.0.0.0:8080 --workers 2 app:app
+          env:
+            - name: APP_NAME
+              value: app-gamma-stress
+            - name: ENABLE_STRESS
+              value: "true"
+            - name: PGHOST
+              value: postgresql.databases.svc.cluster.local
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql
+                  key: database-user
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql
+                  key: database-password
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql
+                  key: database-name
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          volumeMounts:
+            - name: app-code
+              mountPath: /opt/app-root/src/app.py
+              subPath: app.py
+            - name: app-code
+              mountPath: /app/requirements.txt
+              subPath: requirements.txt
+      volumes:
+        - name: app-code
+          configMap:
+            name: db-writer-app
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-gamma-stress
+  namespace: databases
+spec:
+  selector:
+    app: app-gamma-stress
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: app-gamma-stress
+  namespace: databases
+spec:
+  to:
+    kind: Service
+    name: app-gamma-stress
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-delta-deadlock
+  namespace: databases
+  labels:
+    app: app-delta-deadlock
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-delta-deadlock
+  template:
+    metadata:
+      labels:
+        app: app-delta-deadlock
+    spec:
+      containers:
+        - name: app
+          image: registry.access.redhat.com/ubi9/python-311:latest
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              pip install --no-cache-dir -r /app/requirements.txt
+              exec gunicorn --bind 0.0.0.0:8080 --workers 2 app:app
+          env:
+            - name: APP_NAME
+              value: app-delta-deadlock
+            - name: ENABLE_DEADLOCK
+              value: "true"
+            - name: PGHOST
+              value: postgresql.databases.svc.cluster.local
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql
+                  key: database-user
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql
+                  key: database-password
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql
+                  key: database-name
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          volumeMounts:
+            - name: app-code
+              mountPath: /opt/app-root/src/app.py
+              subPath: app.py
+            - name: app-code
+              mountPath: /app/requirements.txt
+              subPath: requirements.txt
+      volumes:
+        - name: app-code
+          configMap:
+            name: db-writer-app
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-delta-deadlock
+  namespace: databases
+spec:
+  selector:
+    app: app-delta-deadlock
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: app-delta-deadlock
+  namespace: databases
+spec:
+  to:
+    kind: Service
+    name: app-delta-deadlock
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

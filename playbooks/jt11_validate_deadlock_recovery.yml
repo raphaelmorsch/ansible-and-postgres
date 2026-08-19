@@ -1,0 +1,92 @@
+---
+- name: JT11 — Validar ambiente após incidente de deadlock
+  hosts: postgresql
+  gather_facts: false
+  vars:
+    vault_url: "{{ vault_base_url }}"
+    vault_secret_name: "{{ vault_secret | default('postgresql-prod') }}"
+    target_ns: "{{ containment_namespace | default(pg_namespace | default('databases')) }}"
+    target_deploy: "{{ containment_target_deployment | default('app-delta-deadlock') }}"
+  tasks:
+    - name: Fetch database credentials from Mock Vault
+      ansible.builtin.uri:
+        url: "{{ vault_url }}/secrets/{{ vault_secret_name }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      register: vault_secret_resp
+      no_log: true
+      delegate_to: localhost
+
+    - name: Set PostgreSQL connection facts from vault
+      ansible.builtin.set_fact:
+        pg_user: "{{ vault_secret_resp.json.username }}"
+        pg_password: "{{ vault_secret_resp.json.password }}"
+        pg_db: "{{ vault_secret_resp.json.database }}"
+        pg_host: "{{ vault_secret_resp.json.host | default(inventory_hostname) }}"
+        pg_port: "{{ vault_secret_resp.json.port | default(5432) }}"
+      no_log: true
+
+    - name: Validate PostgreSQL connectivity and deadlock counter
+      edb.epas_postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          SELECT 1 AS ok;
+          SELECT datname, deadlocks
+          FROM pg_stat_database
+          WHERE datname = current_database();
+      register: validation_data
+      delegate_to: localhost
+
+    - name: Check containment deployment is still scaled down
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ target_deploy }}"
+        namespace: "{{ target_ns }}"
+      register: containment_state
+      delegate_to: localhost
+
+    - name: Build validation status
+      ansible.builtin.set_fact:
+        validation_ok: >-
+          {{
+            (validation_data.query_all_results[0].query_result[0].ok | int) == 1
+            and (containment_state.resources | length) > 0
+            and ((containment_state.resources[0].spec.replicas | int) == 0)
+          }}
+        validation_summary: >-
+          Banco acessível e contenção mantida.
+          deadlocks={{ validation_data.query_all_results[1].query_result[0].deadlocks }},
+          deployment={{ target_deploy }} replicas={{ containment_state.resources[0].spec.replicas | int }}.
+
+    - name: Publish validation artifacts
+      ansible.builtin.set_stats:
+        data:
+          validation_ok: "{{ validation_ok }}"
+          validation_summary: "{{ validation_summary }}"
+          deadlock_counter_after: "{{ validation_data.query_all_results[1].query_result[0].deadlocks }}"
+          comparison:
+            - table: deadlock_lab
+              dead_before: "n/a"
+              dead_after: "n/a"
+              pct_before: "n/a"
+              pct_after: "n/a"
+              size_after: "n/a"
+        per_host: false
+
+    - name: Fail when environment validation is not healthy
+      ansible.builtin.fail:
+        msg: "Validação pós-remediação falhou: {{ validation_summary }}"
+      when: not (validation_ok | bool)
+
+    - name: Show validation summary
+      ansible.builtin.debug:
+        msg:
+          validation_ok: "{{ validation_ok }}"
+          summary: "{{ validation_summary }}"

@@ -1,0 +1,47 @@
+---
+- name: JT09 — Aplicar contenção temporária no OpenShift
+  hosts: localhost
+  gather_facts: false
+  vars:
+    itsm_url: "{{ itsm_base_url }}"
+    target_ns: "{{ pg_namespace | default('databases') }}"
+    target_deploy: "{{ containment_target_deployment | default('app-delta-deadlock') }}"
+  tasks:
+    - name: Scale target deployment to zero replicas
+      kubernetes.core.k8s_scale:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ target_deploy }}"
+        namespace: "{{ target_ns }}"
+        replicas: 0
+        wait: true
+      register: containment_scale
+
+    - name: Update ticket with containment action
+      ansible.builtin.uri:
+        url: "{{ itsm_url }}/api/tickets/{{ ticket_id }}"
+        method: PATCH
+        body_format: json
+        validate_certs: false
+        status_code: 200
+        body:
+          status: in_progress
+          comment: >-
+            Contenção aplicada: Deployment {{ target_deploy }} escalado para 0 réplicas no namespace {{ target_ns }}.
+      when: ticket_id is defined and ticket_id | length > 0
+
+    - name: Publish containment artifacts
+      ansible.builtin.set_stats:
+        data:
+          containment_applied: true
+          containment_target_deployment: "{{ target_deploy }}"
+          containment_namespace: "{{ target_ns }}"
+          containment_replicas: 0
+        per_host: false
+
+    - name: Show containment summary
+      ansible.builtin.debug:
+        msg:
+          deployment: "{{ target_deploy }}"
+          namespace: "{{ target_ns }}"
+          replicas_after: 0

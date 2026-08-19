@@ -1,0 +1,136 @@
+---
+- name: JT08 — Diagnosticar deadlock e abrir incidente
+  hosts: postgresql
+  gather_facts: false
+  vars:
+    vault_url: "{{ vault_base_url }}"
+    vault_secret_name: "{{ vault_secret | default('postgresql-prod') }}"
+    itsm_url: "{{ itsm_base_url }}"
+    deadlock_event: "{{ deadlock_event | default({}) }}"
+  tasks:
+    - name: Fetch database credentials from Mock Vault
+      ansible.builtin.uri:
+        url: "{{ vault_url }}/secrets/{{ vault_secret_name }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      register: vault_secret_resp
+      no_log: true
+      delegate_to: localhost
+
+    - name: Set PostgreSQL connection facts from vault
+      ansible.builtin.set_fact:
+        pg_user: "{{ vault_secret_resp.json.username }}"
+        pg_password: "{{ vault_secret_resp.json.password }}"
+        pg_db: "{{ vault_secret_resp.json.database }}"
+        pg_host: "{{ vault_secret_resp.json.host | default(inventory_hostname) }}"
+        pg_port: "{{ vault_secret_resp.json.port | default(5432) }}"
+      no_log: true
+
+    - name: Collect deadlock metrics
+      edb.epas_postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          SELECT datname, deadlocks
+          FROM pg_stat_database
+          WHERE datname = current_database();
+      register: deadlock_counter_q
+      delegate_to: localhost
+
+    - name: Collect current activity
+      edb.epas_postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          SELECT pid, usename, application_name, state, wait_event_type, wait_event, left(query, 180) AS query
+          FROM pg_stat_activity
+          WHERE datname = current_database()
+            AND state <> 'idle'
+          ORDER BY pid;
+      register: activity_q
+      delegate_to: localhost
+
+    - name: Collect latest deadlock trigger event
+      edb.epas_postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          SELECT app_name, payload, created_at
+          FROM app_events
+          WHERE payload ILIKE '%deadlock trigger%'
+          ORDER BY created_at DESC
+          LIMIT 1;
+      register: trigger_event_q
+      delegate_to: localhost
+
+    - name: Resolve responsible app from event or DB
+      ansible.builtin.set_fact:
+        responsible_app: >-
+          {{
+            deadlock_event.app_name
+            | default(
+                (trigger_event_q.query_result[0].app_name
+                 if (trigger_event_q.query_result | length) > 0
+                 else 'app-delta-deadlock')
+              )
+          }}
+        deadlock_counter: "{{ deadlock_counter_q.query_result[0].deadlocks | int }}"
+        active_sessions: "{{ activity_q.query_result | default([]) }}"
+
+    - name: Open deadlock incident ticket in ITSM Mock
+      ansible.builtin.uri:
+        url: "{{ itsm_url }}/api/tickets"
+        method: POST
+        body_format: json
+        validate_certs: false
+        status_code: 201
+        body:
+          title: "Incidente PostgreSQL — Deadlock detectado"
+          database: "{{ pg_db }}"
+          environment: "{{ pg_environment | default('producao') }}"
+          priority: high
+          status: open
+          description: >-
+            Deadlock detectado pelo PostgreSQL. Iniciando fluxo automático de diagnóstico e contenção.
+          affected_objects:
+            - "application={{ responsible_app }}"
+            - "deadlocks={{ deadlock_counter }}"
+          assignee: "Ansible Automation Platform"
+          comment: >-
+            Evento recebido: {{ deadlock_event | default({}) }}.
+            Sessões ativas observadas: {{ active_sessions | length }}.
+      register: ticket_create
+      delegate_to: localhost
+
+    - name: Publish diagnosis artifacts for workflow
+      ansible.builtin.set_stats:
+        data:
+          ticket_id: "{{ ticket_create.json.ticket_id }}"
+          ticket_created: true
+          incident_type: deadlock
+          pg_database: "{{ pg_db }}"
+          responsible_app: "{{ responsible_app }}"
+          deadlock_counter: "{{ deadlock_counter }}"
+          deadlock_event: "{{ deadlock_event }}"
+          active_sessions: "{{ active_sessions }}"
+          containment_target_deployment: "{{ responsible_app }}"
+        per_host: false
+
+    - name: Show diagnosis summary
+      ansible.builtin.debug:
+        msg:
+          ticket_id: "{{ ticket_create.json.ticket_id }}"
+          responsible_app: "{{ responsible_app }}"
+          deadlock_counter: "{{ deadlock_counter }}"
+          active_sessions: "{{ active_sessions | length }}"

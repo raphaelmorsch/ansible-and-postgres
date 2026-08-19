@@ -1,0 +1,47 @@
+---
+- name: JT12 — Encerrar incidente de deadlock
+  hosts: localhost
+  gather_facts: false
+  vars:
+    itsm_url: "{{ itsm_base_url }}"
+  tasks:
+    - name: Build final incident report
+      ansible.builtin.set_fact:
+        final_report: |
+          Incidente de deadlock tratado automaticamente com aprovação humana.
+
+          Banco: {{ pg_database | default('sampledb') }}
+          Aplicação responsável: {{ responsible_app | default('n/a') }}
+          Contenção: {{ containment_target_deployment | default('n/a') }} escalado para 0 no namespace {{ containment_namespace | default(pg_namespace | default('databases')) }}
+          Sessões terminadas: {{ (terminated_sessions | default([]) | length) }}
+          Validação: {{ validation_summary | default('n/a') }}
+          Deadlocks atuais: {{ deadlock_counter_after | default('n/a') }}
+
+          Responsável: Ansible Automation Platform
+
+    - name: Close incident ticket in ITSM Mock
+      ansible.builtin.uri:
+        url: "{{ itsm_url }}/api/tickets/{{ ticket_id }}"
+        method: PATCH
+        body_format: json
+        validate_certs: false
+        status_code: 200
+        body:
+          status: closed
+          resolution: "Deadlock remediado automaticamente com aprovação humana"
+          assignee: "Ansible Automation Platform"
+          comment: "{{ final_report }}"
+      when: ticket_id is defined and ticket_id | length > 0
+
+    - name: Publish closure artifacts
+      ansible.builtin.set_stats:
+        data:
+          ticket_status: closed
+          final_report: "{{ final_report }}"
+        per_host: false
+
+    - name: Show close summary
+      ansible.builtin.debug:
+        msg:
+          ticket_id: "{{ ticket_id | default('N/A') }}"
+          status: closed

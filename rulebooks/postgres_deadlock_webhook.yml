@@ -1,0 +1,15 @@
+---
+- name: EDA — trigger deadlock response workflow
+  hosts: all
+  sources:
+    - ansible.eda.webhook:
+        host: 0.0.0.0
+        port: 5000
+  rules:
+    - name: Deadlock event received
+      condition: event.payload.event_type == "postgres_deadlock_detected"
+      action:
+        run_playbook:
+          name: playbooks/eda_launch_deadlock_workflow.yml
+          extra_vars:
+            deadlock_event: "{{ event.payload }}"

@@ -1,0 +1,87 @@
+---
+- name: JT10 — Remediação de deadlock (destrutiva sob aprovação)
+  hosts: postgresql
+  gather_facts: false
+  vars:
+    vault_url: "{{ vault_base_url }}"
+    vault_secret_name: "{{ vault_secret | default('postgresql-prod') }}"
+    itsm_url: "{{ itsm_base_url }}"
+    responsible_app: "{{ responsible_app | default('app-delta-deadlock') }}"
+  tasks:
+    - name: Fetch database credentials from Mock Vault
+      ansible.builtin.uri:
+        url: "{{ vault_url }}/secrets/{{ vault_secret_name }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      register: vault_secret_resp
+      no_log: true
+      delegate_to: localhost
+
+    - name: Set PostgreSQL connection facts from vault
+      ansible.builtin.set_fact:
+        pg_user: "{{ vault_secret_resp.json.username }}"
+        pg_password: "{{ vault_secret_resp.json.password }}"
+        pg_db: "{{ vault_secret_resp.json.database }}"
+        pg_host: "{{ vault_secret_resp.json.host | default(inventory_hostname) }}"
+        pg_port: "{{ vault_secret_resp.json.port | default(5432) }}"
+      no_log: true
+
+    - name: Terminate remaining sessions from responsible application
+      edb.epas_postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          SELECT pg_terminate_backend(pid) AS terminated, pid
+          FROM pg_stat_activity
+          WHERE datname = current_database()
+            AND application_name = '{{ responsible_app }}'
+            AND pid <> pg_backend_pid();
+      register: terminated_sessions
+      delegate_to: localhost
+
+    - name: Run post-incident hygiene on deadlock lab table
+      edb.epas_postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          VACUUM (ANALYZE) deadlock_lab;
+      delegate_to: localhost
+
+    - name: Update ticket after remediating deadlock
+      ansible.builtin.uri:
+        url: "{{ itsm_url }}/api/tickets/{{ ticket_id }}"
+        method: PATCH
+        body_format: json
+        validate_certs: false
+        status_code: 200
+        body:
+          status: in_progress
+          comment: >-
+            Remediação executada após aprovação humana:
+            sessões de {{ responsible_app }} terminadas={{ terminated_sessions.query_result | length }}.
+      when: ticket_id is defined and ticket_id | length > 0
+      delegate_to: localhost
+
+    - name: Publish remediation artifacts
+      ansible.builtin.set_stats:
+        data:
+          remediation_done: true
+          terminated_sessions: "{{ terminated_sessions.query_result | default([]) }}"
+          maintenance_actions_done:
+            - "Terminou sessões ativas da aplicação {{ responsible_app }}"
+            - "Executou VACUUM (ANALYZE) na tabela deadlock_lab"
+        per_host: false
+
+    - name: Show remediation summary
+      ansible.builtin.debug:
+        msg:
+          responsible_app: "{{ responsible_app }}"
+          terminated_sessions: "{{ terminated_sessions.query_result | length }}"
