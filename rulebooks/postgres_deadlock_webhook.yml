@@ -11,5 +11,6 @@
       action:
         run_playbook:
           name: playbooks/eda_launch_deadlock_workflow.yml
+          inventory: inventory/hosts.yml
           extra_vars:
             deadlock_event: "{{ event.payload }}"
