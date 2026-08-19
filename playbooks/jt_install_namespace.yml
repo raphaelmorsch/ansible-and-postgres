@@ -1,0 +1,23 @@
+---
+- name: JT-Install — Garantir namespace databases
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    pg_namespace: "{{ pg_namespace | default('databases') }}"
+  tasks:
+    - name: Ensure PostgreSQL namespace exists
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Namespace
+        name: "{{ pg_namespace }}"
+        state: present
+        definition:
+          metadata:
+            name: "{{ pg_namespace }}"
+            labels:
+              app.kubernetes.io/part-of: aap-pg-maintenance
+
+    - name: Show namespace status
+      ansible.builtin.debug:
+        msg: "Namespace {{ pg_namespace }} is ready for PostgreSQL deployment"

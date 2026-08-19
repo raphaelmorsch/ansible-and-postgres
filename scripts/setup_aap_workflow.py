@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import ssl
+import subprocess
 import sys
 import time
 import urllib.error
@@ -16,17 +17,19 @@ import urllib.request
 SSL_CONTEXT = ssl._create_unverified_context()
 
 AAP_URL = os.environ.get(
-    "AAP_URL", "https://aap-aap.apps.cluster-bfd7z-1.dyn.redhatworkshops.io"
+    "AAP_URL", "https://aap-aap.apps.cluster-d796h.dyn.redhatworkshops.io"
 ).rstrip("/")
 API = f"{AAP_URL}/api/controller/v2"
 USERNAME = os.environ.get("AAP_USERNAME", "admin")
-PASSWORD = os.environ.get("AAP_PASSWORD", "Mjk0NTYz_1")
+PASSWORD = os.environ.get("AAP_PASSWORD", "083RpsIxThJl")
 ORG_NAME = os.environ.get("AAP_ORG", "Default")
 PROJECT_NAME = "postgresql-preventive-maintenance"
 INVENTORY_NAME = "PostgreSQL Inventories"
+PG_HOST = os.environ.get("PG_HOST", "postgresql.databases.svc.cluster.local")
+PG_NAMESPACE = os.environ.get("PG_NAMESPACE", "databases")
 SCM_URL = os.environ.get(
     "SCM_URL",
-    "http://demo-git.demo-git.svc.cluster.local/ansible-and-postgres.git",
+    "https://github.com/raphaelmorsch/ansible-and-postgres.git",
 )
 VAULT_URL = os.environ.get(
     "VAULT_URL", "http://mock-vault.mock-vault.svc.cluster.local:8080"
@@ -111,6 +114,49 @@ def wait_project(api: AAP, project_id: int, timeout=300):
             raise RuntimeError(f"project sync failed: {project}")
         time.sleep(5)
     raise TimeoutError("project sync timed out")
+
+
+def openshift_token() -> tuple[str, str]:
+    """Return (api_host, bearer_token) for OpenShift install playbooks."""
+    token = os.environ.get("OPENSHIFT_TOKEN", "")
+    host = os.environ.get("OPENSHIFT_API", "")
+    if not token or not host:
+        try:
+            host = host or subprocess.check_output(
+                ["oc", "whoami", "--show-server"], text=True
+            ).strip()
+            token = token or subprocess.check_output(
+                ["oc", "whoami", "-t"], text=True
+            ).strip()
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            raise RuntimeError(
+                "Set OPENSHIFT_TOKEN/OPENSHIFT_API or login with oc before setup"
+            ) from exc
+    return host, token
+
+
+def ensure_openshift_credential(api: AAP, org_id: int, cred_types: dict):
+    openshift_type = cred_types.get("OpenShift or Kubernetes API Bearer Token")
+    if not openshift_type:
+        openshift_type = cred_types.get("OpenShift or Kubernetes API")
+    if not openshift_type:
+        raise RuntimeError("OpenShift credential type not found in AAP")
+    host, token = openshift_token()
+    return api.upsert(
+        "/credentials/",
+        "OpenShift Cluster Admin",
+        {
+            "name": "OpenShift Cluster Admin",
+            "description": "Cluster API token for PostgreSQL install playbooks",
+            "organization": org_id,
+            "credential_type": openshift_type["id"],
+            "inputs": {
+                "host": host,
+                "bearer_token": token,
+                "verify_ssl": False,
+            },
+        },
+    )
 
 
 def ensure_controlplane_jobs(api: AAP):
@@ -203,8 +249,11 @@ def main():
         )
         print(f"created group postgresql id={group['id']}")
 
+    openshift_cred = ensure_openshift_credential(api, org["id"], cred_types)
+    print(f"openshift credential id={openshift_cred['id']}")
+
     host_payload = {
-        "name": "postgresql.postgresql.svc.cluster.local",
+        "name": PG_HOST,
         "inventory": inventory["id"],
         "variables": json.dumps(
             {
@@ -216,7 +265,7 @@ def main():
     }
     existing_in_inv = api.find_one(
         f"/inventories/{inventory['id']}/hosts/",
-        name="postgresql.postgresql.svc.cluster.local",
+        name=PG_HOST,
     )
     if existing_in_inv:
         host = api.patch(f"/hosts/{existing_in_inv['id']}/", host_payload)
@@ -224,6 +273,20 @@ def main():
         host = api.post("/hosts/", host_payload)
     api.post(f"/groups/{group['id']}/hosts/", {"id": host["id"]})
     print(f"host {host['id']} in group {group['id']}")
+
+    for legacy_host in (
+        "postgresql.postgresql.svc.cluster.local",
+        "postgresql.databases.svc.cluster.local",
+    ):
+        if legacy_host == PG_HOST:
+            continue
+        old = api.find_one(f"/inventories/{inventory['id']}/hosts/", name=legacy_host)
+        if old:
+            try:
+                api.delete(f"/hosts/{old['id']}/")
+                print(f"removed legacy host {legacy_host}")
+            except RuntimeError as exc:
+                print(f"legacy host cleanup warning: {exc}")
 
     # Machine credential unused for local connection, but keep for demo narrative.
     api.upsert(
@@ -246,7 +309,13 @@ def main():
         "itsm_base_url": ITSM_URL,
         "force_maintenance_window": True,
         "pg_max_connections_for_maintenance": 50,
+        "pg_namespace": PG_NAMESPACE,
     }
+
+    install_templates = [
+        ("JT-Install — Namespace databases", "playbooks/jt_install_namespace.yml"),
+        ("JT-Install — PostgreSQL", "playbooks/jt_install_postgresql.yml"),
+    ]
 
     job_templates = [
         ("JT00 — Gerar Tuplas Mortas", "playbooks/jt00_generate_dead_tuples.yml"),
@@ -259,8 +328,9 @@ def main():
         ("JT07 — Atualizar ticket como pendente", "playbooks/jt07_mark_ticket_pending.yml"),
     ]
 
+    install_names = {name for name, _ in install_templates}
     jt_ids = {}
-    for name, playbook in job_templates:
+    for name, playbook in install_templates + job_templates:
         payload = {
             "name": name,
             "description": name,
@@ -277,6 +347,14 @@ def main():
             payload["execution_environment"] = ee["id"]
         jt = api.upsert("/job_templates/", name, payload)
         jt_ids[name] = jt["id"]
+        if name in install_names:
+            try:
+                api.post(
+                    f"/job_templates/{jt['id']}/credentials/",
+                    {"id": openshift_cred["id"]},
+                )
+            except RuntimeError as exc:
+                print(f"openshift credential attach warning for {name}: {exc}")
 
     wf_name = "WF — Manutenção Preventiva PostgreSQL"
     wf = api.upsert(
@@ -339,7 +417,51 @@ def main():
     relate(n3, n4, "success_nodes")
     relate(n4, n5, "success_nodes")
     relate(n3, n6, "failure_nodes")
+    relate(n4, n6, "failure_nodes")
     relate(n6, n7, "always_nodes")
+
+    install_wf_name = "WF — Instalar PostgreSQL (OpenShift)"
+    install_wf = api.upsert(
+        "/workflow_job_templates/",
+        install_wf_name,
+        {
+            "name": install_wf_name,
+            "description": (
+                "Cria o namespace databases (se necessário), instala PostgreSQL "
+                "e gera tuplas mortas para a demo de manutenção."
+            ),
+            "organization": org["id"],
+            "inventory": inventory["id"],
+            "extra_vars": json.dumps(extra_vars),
+            "ask_variables_on_launch": False,
+            "survey_enabled": False,
+            "allow_simultaneous": False,
+        },
+    )
+    install_nodes = api.get(
+        f"/workflow_job_templates/{install_wf['id']}/workflow_nodes/"
+    )["results"]
+    for node in install_nodes:
+        try:
+            api.delete(f"/workflow_job_template_nodes/{node['id']}/")
+        except RuntimeError as exc:
+            print(f"install wf node delete warning: {exc}")
+
+    def add_install_node(jt_name: str):
+        payload = {
+            "unified_job_template": jt_ids[jt_name],
+            "identifier": jt_name,
+        }
+        return api.post(
+            f"/workflow_job_templates/{install_wf['id']}/workflow_nodes/",
+            payload,
+        )
+
+    i1 = add_install_node("JT-Install — Namespace databases")
+    i2 = add_install_node("JT-Install — PostgreSQL")
+    i3 = add_install_node("JT00 — Gerar Tuplas Mortas")
+    relate(i1, i2, "success_nodes")
+    relate(i2, i3, "success_nodes")
 
     # Optional weekly schedule (Sunday 02:00)
     schedule_name = "Weekly Sunday 02:00"
@@ -379,6 +501,8 @@ def main():
             {
                 "workflow_id": wf["id"],
                 "workflow_name": wf_name,
+                "install_workflow_id": install_wf["id"],
+                "install_workflow_name": install_wf_name,
                 "project_id": project["id"],
                 "inventory_id": inventory["id"],
                 "job_templates": jt_ids,

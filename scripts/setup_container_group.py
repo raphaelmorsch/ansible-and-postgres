@@ -16,17 +16,16 @@ import urllib.request
 
 SSL_CONTEXT = ssl._create_unverified_context()
 AAP_URL = os.environ.get(
-    "AAP_URL", "https://aap-aap.apps.cluster-bfd7z-1.dyn.redhatworkshops.io"
+    "AAP_URL", "https://aap-aap.apps.cluster-d796h.dyn.redhatworkshops.io"
 ).rstrip("/")
 API = f"{AAP_URL}/api/controller/v2"
 AUTH = base64.b64encode(
-    f"{os.environ.get('AAP_USERNAME', 'admin')}:{os.environ.get('AAP_PASSWORD', 'Mjk0NTYz_1')}".encode()
+    f"{os.environ.get('AAP_USERNAME', 'admin')}:{os.environ.get('AAP_PASSWORD', '083RpsIxThJl')}".encode()
 ).decode()
 NS = "aap-ee"
 SA = "aap-ee-runner"
 IG_NAME = "openshift-ee"
 CRED_NAME = "OpenShift EE Container Group"
-JT_IDS = [12, 13, 14, 15, 16, 17, 18]
 
 
 def oc(*args: str) -> str:
@@ -126,9 +125,20 @@ type: kubernetes.io/service-account-token
     raise RuntimeError("timed out waiting for SA token")
 
 
+def list_project_job_template_ids() -> list[int]:
+    _, projects = api("GET", "/projects/?name=postgresql-preventive-maintenance")
+    if not projects.get("count"):
+        return []
+    project_id = projects["results"][0]["id"]
+    _, jts = api("GET", f"/job_templates/?project={project_id}&page_size=100")
+    return [jt["id"] for jt in jts.get("results", [])]
+
+
 def main():
     token, host = ensure_cluster_rbac()
     print(f"OpenShift API host ready (token length={len(token)})")
+    jt_ids = list_project_job_template_ids()
+    print(f"found {len(jt_ids)} job templates for postgresql-preventive-maintenance")
 
     _, existing = api("GET", f"/credentials/?name={urllib.parse.quote(CRED_NAME)}")
     inputs = {"host": host, "bearer_token": token, "verify_ssl": False}
@@ -188,7 +198,7 @@ def main():
         _, ig = api("POST", "/instance_groups/", payload)
         ig_id = ig["id"]
 
-    for jt_id in JT_IDS:
+    for jt_id in jt_ids:
         try:
             api(
                 "POST",
@@ -202,8 +212,10 @@ def main():
 
     # Cancel stuck workflow/job if still pending for capacity
     _, jobs = api("GET", "/jobs/?status=pending&page_size=20")
+    jt_id_set = set(jt_ids)
     for job in jobs.get("results", []):
-        if job.get("summary_fields", {}).get("job_template", {}).get("id") in JT_IDS:
+        jt = job.get("summary_fields", {}).get("job_template", {})
+        if jt.get("id") in jt_id_set:
             print(f"canceling pending job {job['id']}")
             try:
                 api("POST", f"/jobs/{job['id']}/cancel/", {})

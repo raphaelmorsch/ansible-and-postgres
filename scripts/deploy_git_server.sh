@@ -13,6 +13,8 @@ mkdir -p "$WORKDIR"
 cp -R "$ROOT/playbooks" "$WORKDIR/"
 cp -R "$ROOT/inventory" "$WORKDIR/"
 cp -R "$ROOT/collections" "$WORKDIR/"
+cp -R "$ROOT/openshift" "$WORKDIR/"
+cp -R "$ROOT/sql" "$WORKDIR/"
 cp "$ROOT/ansible.cfg" "$WORKDIR/"
 [[ -f "$ROOT/README.md" ]] && cp "$ROOT/README.md" "$WORKDIR/"
 

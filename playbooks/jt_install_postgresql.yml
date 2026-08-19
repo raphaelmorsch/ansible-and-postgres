@@ -1,0 +1,44 @@
+---
+- name: JT-Install — Instalar PostgreSQL no OpenShift
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    pg_namespace: "{{ pg_namespace | default('databases') }}"
+    pg_manifest: "{{ playbook_dir }}/../openshift/postgresql-databases.yaml"
+  tasks:
+    - name: Load PostgreSQL manifests
+      ansible.builtin.set_fact:
+        pg_resources: "{{ lookup('file', pg_manifest) | from_yaml_all | list }}"
+
+    - name: Deploy PostgreSQL resources
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ pg_namespace }}"
+        definition: "{{ item }}"
+      loop: "{{ pg_resources }}"
+      loop_control:
+        label: "{{ item.kind }}/{{ item.metadata.name }}"
+
+    - name: Wait for PostgreSQL pod to become Ready
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ pg_namespace }}"
+        label_selectors:
+          - name=postgresql
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+      register: pg_pods
+
+    - name: Show PostgreSQL endpoint
+      ansible.builtin.debug:
+        msg:
+          host: "postgresql.{{ pg_namespace }}.svc.cluster.local"
+          port: 5432
+          database: sampledb
+          user: user1
+          pods_ready: "{{ pg_pods.resources | length }}"

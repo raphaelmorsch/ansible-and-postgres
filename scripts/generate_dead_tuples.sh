@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-NS="${POSTGRES_NAMESPACE:-postgresql}"
+NS="${POSTGRES_NAMESPACE:-databases}"
 JOB_NAME="${JOB_NAME:-generate-dead-tuples}"
 SQL_FILE="$ROOT/sql/generate_dead_tuples.sql"
 

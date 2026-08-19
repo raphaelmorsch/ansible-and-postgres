@@ -24,14 +24,14 @@ data:
             "username": os.environ.get("PG_USERNAME", "user1"),
             "password": os.environ.get("PG_PASSWORD", "password1"),
             "database": os.environ.get("PG_DATABASE", "sampledb"),
-            "host": os.environ.get("PG_HOST", "postgresql.postgresql.svc.cluster.local"),
+            "host": os.environ.get("PG_HOST", "postgresql.databases.svc.cluster.local"),
             "port": int(os.environ.get("PG_PORT", "5432")),
         },
         "postgresql-dev": {
             "username": os.environ.get("PG_USERNAME", "user1"),
             "password": os.environ.get("PG_PASSWORD", "password1"),
             "database": os.environ.get("PG_DATABASE", "sampledb"),
-            "host": os.environ.get("PG_HOST", "postgresql.postgresql.svc.cluster.local"),
+            "host": os.environ.get("PG_HOST", "postgresql.databases.svc.cluster.local"),
             "port": int(os.environ.get("PG_PORT", "5432")),
         },
     }
@@ -75,7 +75,7 @@ stringData:
   PG_USERNAME: user1
   PG_PASSWORD: password1
   PG_DATABASE: sampledb
-  PG_HOST: postgresql.postgresql.svc.cluster.local
+  PG_HOST: postgresql.databases.svc.cluster.local
   PG_PORT: "5432"
 ---
 apiVersion: apps/v1
