@@ -9,8 +9,8 @@
     - name: Deadlock event received
       condition: event.payload.event_type == "postgres_deadlock_detected"
       action:
-        run_playbook:
-          name: playbooks/eda_launch_deadlock_workflow.yml
-          inventory: inventory/hosts.yml
+        run_job_template:
+          name: WF — Resposta a Deadlock PostgreSQL
+          organization: Default
           extra_vars:
             deadlock_event: "{{ event.payload }}"

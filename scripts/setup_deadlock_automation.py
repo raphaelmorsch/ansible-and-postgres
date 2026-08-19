@@ -26,13 +26,13 @@ ORG_NAME = os.environ.get("AAP_ORG", "Default")
 PROJECT_NAME = "postgresql-preventive-maintenance"
 INVENTORY_NAME = "PostgreSQL Inventories"
 EDA_PROJECT_URL = os.environ.get(
-    "EDA_PROJECT_URL", "http://demo-git.demo-git.svc.cluster.local/ansible-and-postgres.git"
+    "EDA_PROJECT_URL", "https://github.com/raphaelmorsch/ansible-and-postgres.git"
 )
 EDA_DE_IMAGE = os.environ.get(
     "EDA_DECISION_ENV_IMAGE", "quay.io/ansible/ansible-rulebook:latest"
 )
 WF_NAME = "WF — Resposta a Deadlock PostgreSQL"
-EDA_ACTIVATION_NAME = "Activation — PostgreSQL Deadlock AutoResponse"
+EDA_ACTIVATION_NAME = "Activation Deadlock AutoResponse v2"
 
 
 class Api:
@@ -99,15 +99,6 @@ def ensure_deadlock_workflow(ctrl: Api):
             "Projeto/inventário do AAP não encontrado. Execute setup_aap_workflow.py antes."
         )
 
-    # Remove legacy shim (same name as workflow, but as Job Template).
-    legacy_shim = ctrl.find_one("/job_templates/", name=WF_NAME)
-    if legacy_shim and legacy_shim.get("description") == "EDA launcher shim":
-        try:
-            ctrl.delete(f"/job_templates/{legacy_shim['id']}/")
-            print(f"removed legacy shim job template id={legacy_shim['id']}")
-        except RuntimeError as exc:
-            print(f"legacy shim delete warning: {exc}")
-
     ee = ctrl.find_one("/execution_environments/", name="Default execution environment")
     extra_vars = {
         "vault_base_url": "http://mock-vault.mock-vault.svc.cluster.local:8080",
@@ -171,6 +162,23 @@ def ensure_deadlock_workflow(ctrl: Api):
             "allow_simultaneous": False,
         },
     )
+
+    # Ensure launcher shim exists for EDA run_job_template action.
+    shim_payload = {
+        "name": WF_NAME,
+        "description": "EDA launcher shim",
+        "job_type": "run",
+        "inventory": inventory["id"],
+        "project": project["id"],
+        "playbook": "playbooks/eda_launch_deadlock_workflow.yml",
+        "extra_vars": json.dumps({}),
+        "ask_variables_on_launch": False,
+        "allow_simultaneous": False,
+        "verbosity": 1,
+    }
+    if ee:
+        shim_payload["execution_environment"] = ee["id"]
+    shim_jt = ctrl.upsert("/job_templates/", WF_NAME, shim_payload)
 
     # Recreate workflow graph.
     for node in ctrl.get(f"/workflow_job_templates/{wf['id']}/workflow_nodes/")["results"]:
@@ -236,10 +244,15 @@ def ensure_deadlock_workflow(ctrl: Api):
                 ctrl.post(f"/job_templates/{jt_id}/instance_groups/", {"id": ig["id"]})
             except RuntimeError as exc:
                 print(f"instance group warning JT {jt_id}: {exc}")
+        try:
+            ctrl.post(f"/job_templates/{shim_jt['id']}/instance_groups/", {"id": ig["id"]})
+        except RuntimeError as exc:
+            print(f"instance group warning shim JT {shim_jt['id']}: {exc}")
 
     return {
         "deadlock_workflow_id": wf["id"],
         "deadlock_workflow_name": WF_NAME,
+        "deadlock_launcher_jt_id": shim_jt["id"],
         "approval_node_id": approval_node["id"],
         "deadlock_job_templates": jt_ids,
     }
@@ -289,7 +302,11 @@ def ensure_eda_activation(eda: Api):
             }
         time.sleep(5)
 
-    rb = eda.find_one("/rulebooks/", name="postgres_deadlock_webhook.yml")
+    rb_data = eda.get(f"/rulebooks/?project_id={proj['id']}")
+    rb = next(
+        (item for item in rb_data.get("results", []) if item.get("name") == "postgres_deadlock_webhook.yml"),
+        None,
+    )
     if not rb:
         return {
             "eda_status": "warning",
@@ -316,21 +333,43 @@ def ensure_eda_activation(eda: Api):
         },
     )
 
-    act = eda.upsert(
-        "/activations/",
-        EDA_ACTIVATION_NAME,
-        {
-            "name": EDA_ACTIVATION_NAME,
-            "description": "Receive deadlock webhook and launch controller workflow.",
-            "is_enabled": True,
-            "decision_environment_id": de["id"],
-            "rulebook_id": rb["id"],
-            "organization_id": org["id"],
-            "restart_policy": "always",
-            "log_level": "info",
-            "eda_credentials": [cred["id"]],
-        },
-    )
+    activation_payload = {
+        "name": EDA_ACTIVATION_NAME,
+        "description": "Receive deadlock webhook and launch controller workflow.",
+        "is_enabled": True,
+        "decision_environment_id": de["id"],
+        "rulebook_id": rb["id"],
+        "organization_id": org["id"],
+        "restart_policy": "always",
+        "log_level": "info",
+        "eda_credentials": [cred["id"]],
+    }
+    existing_act = eda.find_one("/activations/", name=EDA_ACTIVATION_NAME)
+    if existing_act:
+        print(f"update /activations/ {EDA_ACTIVATION_NAME} id={existing_act['id']}")
+        try:
+            act = eda.patch(f"/activations/{existing_act['id']}/", activation_payload)
+        except RuntimeError as exc:
+            if "Activation is not in disabled mode and in stopped status" not in str(exc):
+                raise
+            print("activation update requires disable/enable cycle")
+            try:
+                eda.post(f"/activations/{existing_act['id']}/disable/", {})
+            except RuntimeError as disable_exc:
+                print(f"activation disable warning: {disable_exc}")
+            for _ in range(24):
+                status = eda.get(f"/activations/{existing_act['id']}/").get("status")
+                if status in {"disabled", "stopped"}:
+                    break
+                time.sleep(2)
+            act = eda.patch(f"/activations/{existing_act['id']}/", activation_payload)
+            try:
+                eda.post(f"/activations/{existing_act['id']}/enable/", {})
+            except RuntimeError as enable_exc:
+                print(f"activation enable warning: {enable_exc}")
+    else:
+        print(f"create /activations/ {EDA_ACTIVATION_NAME}")
+        act = eda.post("/activations/", activation_payload)
     act_full = eda.get(f"/activations/{act['id']}/")
     return {
         "eda_status": "configured",
