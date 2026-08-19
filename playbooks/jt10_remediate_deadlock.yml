@@ -6,7 +6,7 @@
     vault_url: "{{ vault_base_url }}"
     vault_secret_name: "{{ vault_secret | default('postgresql-prod') }}"
     itsm_url: "{{ itsm_base_url }}"
-    responsible_app: "{{ responsible_app | default('app-delta-deadlock') }}"
+    responsible_app_effective: "{{ (deadlock_event | default({})).get('app_name') | default(responsible_app | default('app-delta-deadlock')) }}"
   tasks:
     - name: Fetch database credentials from Mock Vault
       ansible.builtin.uri:
@@ -39,7 +39,7 @@
           SELECT pg_terminate_backend(pid) AS terminated, pid
           FROM pg_stat_activity
           WHERE datname = current_database()
-            AND application_name = '{{ responsible_app }}'
+            AND application_name = '{{ responsible_app_effective }}'
             AND pid <> pg_backend_pid();
       register: terminated_sessions
       delegate_to: localhost
@@ -67,7 +67,7 @@
           status: in_progress
           comment: >-
             Remediação executada após aprovação humana:
-            sessões de {{ responsible_app }} terminadas={{ terminated_sessions.query_result | length }}.
+            sessões de {{ responsible_app_effective }} terminadas={{ terminated_sessions.query_result | length }}.
       when: ticket_id is defined and ticket_id | length > 0
       delegate_to: localhost
 
@@ -77,12 +77,12 @@
           remediation_done: true
           terminated_sessions: "{{ terminated_sessions.query_result | default([]) }}"
           maintenance_actions_done:
-            - "Terminou sessões ativas da aplicação {{ responsible_app }}"
+            - "Terminou sessões ativas da aplicação {{ responsible_app_effective }}"
             - "Executou VACUUM (ANALYZE) na tabela deadlock_lab"
         per_host: false
 
     - name: Show remediation summary
       ansible.builtin.debug:
         msg:
-          responsible_app: "{{ responsible_app }}"
+          responsible_app: "{{ responsible_app_effective }}"
           terminated_sessions: "{{ terminated_sessions.query_result | length }}"
