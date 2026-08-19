@@ -51,6 +51,7 @@
         login_user: "{{ pg_user }}"
         login_password: "{{ pg_password }}"
         login_db: "{{ pg_db }}"
+        autocommit: true
         query: |
           VACUUM (ANALYZE) deadlock_lab;
       delegate_to: localhost
