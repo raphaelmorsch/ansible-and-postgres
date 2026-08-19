@@ -32,6 +32,7 @@ EDA_DE_IMAGE = os.environ.get(
     "EDA_DECISION_ENV_IMAGE", "quay.io/ansible/ansible-rulebook:latest"
 )
 WF_NAME = "WF — Resposta a Deadlock PostgreSQL"
+EDA_ACTIVATION_NAME = "Activation — PostgreSQL Deadlock AutoResponse"
 
 
 class Api:
@@ -97,6 +98,15 @@ def ensure_deadlock_workflow(ctrl: Api):
         raise RuntimeError(
             "Projeto/inventário do AAP não encontrado. Execute setup_aap_workflow.py antes."
         )
+
+    # Remove legacy shim (same name as workflow, but as Job Template).
+    legacy_shim = ctrl.find_one("/job_templates/", name=WF_NAME)
+    if legacy_shim and legacy_shim.get("description") == "EDA launcher shim":
+        try:
+            ctrl.delete(f"/job_templates/{legacy_shim['id']}/")
+            print(f"removed legacy shim job template id={legacy_shim['id']}")
+        except RuntimeError as exc:
+            print(f"legacy shim delete warning: {exc}")
 
     ee = ctrl.find_one("/execution_environments/", name="Default execution environment")
     extra_vars = {
@@ -288,11 +298,29 @@ def ensure_eda_activation(eda: Api):
             "eda_import_error": "rulebook postgres_deadlock_webhook.yml não encontrado",
         }
 
+    cred = eda.upsert(
+        "/eda-credentials/",
+        "AAP EDA Credential",
+        {
+            "name": "AAP EDA Credential",
+            "description": "Credential used by EDA to call AAP controller APIs.",
+            "organization_id": org["id"],
+            "credential_type_id": 4,
+            "inputs": {
+                "host": f"{AAP_URL}/api/controller/",
+                "username": USERNAME,
+                "password": PASSWORD,
+                "verify_ssl": False,
+                "request_timeout": "10",
+            },
+        },
+    )
+
     act = eda.upsert(
         "/activations/",
-        "Activation — PostgreSQL Deadlock AutoResponse",
+        EDA_ACTIVATION_NAME,
         {
-            "name": "Activation — PostgreSQL Deadlock AutoResponse",
+            "name": EDA_ACTIVATION_NAME,
             "description": "Receive deadlock webhook and launch controller workflow.",
             "is_enabled": True,
             "decision_environment_id": de["id"],
@@ -300,6 +328,7 @@ def ensure_eda_activation(eda: Api):
             "organization_id": org["id"],
             "restart_policy": "always",
             "log_level": "info",
+            "eda_credentials": [cred["id"]],
         },
     )
     act_full = eda.get(f"/activations/{act['id']}/")
