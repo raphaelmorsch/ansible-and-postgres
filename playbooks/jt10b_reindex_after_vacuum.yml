@@ -1,0 +1,113 @@
+---
+- name: JT10b — Reindexar tabela após VACUUM de remediação de deadlock
+  hosts: postgresql
+  gather_facts: false
+  vars:
+    vault_url: "{{ vault_base_url }}"
+    vault_secret_name: "{{ vault_secret | default('postgresql-prod') }}"
+    target_table: "{{ deadlock_target_table | default('deadlock_lab') }}"
+    target_schema: "{{ deadlock_target_schema | default('public') }}"
+    target_fq_name: "{{ target_schema }}.{{ target_table }}"
+  tasks:
+    - name: Fetch database credentials from Mock Vault
+      ansible.builtin.uri:
+        url: "{{ vault_url }}/secrets/{{ vault_secret_name }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      register: vault_secret_resp
+      no_log: true
+      delegate_to: localhost
+
+    - name: Set PostgreSQL connection facts from vault
+      ansible.builtin.set_fact:
+        pg_user: "{{ vault_secret_resp.json.username }}"
+        pg_password: "{{ vault_secret_resp.json.password }}"
+        pg_db: "{{ vault_secret_resp.json.database }}"
+        pg_host: "{{ vault_secret_resp.json.host | default(inventory_hostname) }}"
+        pg_port: "{{ vault_secret_resp.json.port | default(5432) }}"
+      no_log: true
+
+    - name: Confirm VACUUM was executed recently on target table
+      edb.epas_postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          SELECT
+            schemaname,
+            relname AS table_name,
+            n_live_tup,
+            n_dead_tup,
+            last_vacuum,
+            last_autovacuum,
+            pg_size_pretty(pg_total_relation_size(schemaname || '.' || relname)) AS total_size
+          FROM pg_stat_user_tables
+          WHERE schemaname = '{{ target_schema }}'
+            AND relname = '{{ target_table }}';
+      register: pre_reindex_stats
+      delegate_to: localhost
+
+    - name: Fail when target table was not found
+      ansible.builtin.fail:
+        msg: "Tabela {{ target_fq_name }} não encontrada em pg_stat_user_tables."
+      when: pre_reindex_stats.query_result | length == 0
+
+    - name: Rebuild indexes on table affected by deadlock incident
+      edb.epas_postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        autocommit: true
+        query: |
+          REINDEX TABLE {{ target_fq_name }};
+      register: reindex_result
+      delegate_to: localhost
+
+    - name: Collect post-REINDEX table health snapshot
+      edb.epas_postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          SELECT
+            schemaname,
+            relname AS table_name,
+            n_live_tup,
+            n_dead_tup,
+            ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_tuple_percent,
+            pg_size_pretty(pg_total_relation_size(schemaname || '.' || relname)) AS total_size,
+            last_vacuum,
+            last_autovacuum
+          FROM pg_stat_user_tables
+          WHERE schemaname = '{{ target_schema }}'
+            AND relname = '{{ target_table }}';
+      register: post_reindex_stats
+      delegate_to: localhost
+
+    - name: Publish post-VACUUM reindex artifacts
+      ansible.builtin.set_stats:
+        data:
+          reindex_done: true
+          reindexed_table: "{{ target_fq_name }}"
+          table_health_before: "{{ pre_reindex_stats.query_result[0] }}"
+          table_health_after: "{{ post_reindex_stats.query_result[0] }}"
+          maintenance_actions_done:
+            - "Executou REINDEX TABLE em {{ target_fq_name }} após VACUUM de remediação"
+        per_host: false
+
+    - name: Show post-REINDEX summary
+      ansible.builtin.debug:
+        msg:
+          table: "{{ target_fq_name }}"
+          dead_tuples_before: "{{ pre_reindex_stats.query_result[0].n_dead_tup }}"
+          dead_tuples_after: "{{ post_reindex_stats.query_result[0].n_dead_tup }}"
+          total_size_after: "{{ post_reindex_stats.query_result[0].total_size }}"
+          last_vacuum: "{{ post_reindex_stats.query_result[0].last_vacuum | default(post_reindex_stats.query_result[0].last_autovacuum) }}"
