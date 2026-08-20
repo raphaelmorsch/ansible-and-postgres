@@ -1,0 +1,52 @@
+---
+- name: JT11a - Realizar healthcheck do PostgreSQL considerando vars do vault
+  hosts: postgresql
+  gather_facts: false
+  vars:
+    vault_url: "{{ vault_base_url }}"
+    vault_secret_name: "{{ vault_secret | default('postgresql-prod') }}"
+    target_ns: "{{ containment_namespace | default(pg_namespace | default('databases')) }}"
+    target_deploy: "{{ containment_target_deployment | default('app-delta-deadlock') }}"
+  tasks:
+    - name: Fetch database credentials from Mock Vault
+      ansible.builtin.uri:
+        url: "{{ vault_url }}/secrets/{{ vault_secret_name }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        validate_certs: false
+      register: vault_secret_resp
+      no_log: true
+
+    - name: Set PostgreSQL connection facts from vault
+      ansible.builtin.set_fact:
+        pg_user: "{{ vault_secret_resp.json.username }}"
+        pg_password: "{{ vault_secret_resp.json.password }}"
+        pg_db: "{{ vault_secret_resp.json.database }}"
+        pg_host: "{{ vault_secret_resp.json.host | default(inventory_hostname) }}"
+        pg_port: "{{ vault_secret_resp.json.port | default(5432) }}"
+      no_log: true
+
+    - name: Validate PostgreSQL connectivity
+      edb.epas_postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          SELECT 1 AS ok;
+      register: validation_connectivity
+
+    - name: Count PostgreSQL sessions waiting for locks
+      edb.epas_postgresql.postgresql_query:
+        login_host: "{{ pg_host }}"
+        login_port: "{{ pg_port }}"
+        login_user: "{{ pg_user }}"
+        login_password: "{{ pg_password }}"
+        login_db: "{{ pg_db }}"
+        query: |
+          SELECT count(*) AS waiting_sessions
+          FROM pg_stat_activity
+          WHERE wait_event IS NOT NULL;
+      register: validation_waiting_sessions
